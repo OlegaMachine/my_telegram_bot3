@@ -1029,8 +1029,8 @@ async def exchange_bonus_handler(update: Update, context: ContextTypes.DEFAULT_T
 def main():
     """Основная функция запуска бота"""
     init_db()
-    
-    # Создаем Application с JobQueue
+
+    # Создаем Application
     application = (
         ApplicationBuilder()
         .token(TOKEN)
@@ -1073,15 +1073,14 @@ def main():
     )
 
     application.add_handler(conv_handler)
-    
-    # Запуск очистки старых данных (если установлен JobQueue)
+
+    # Запуск очистки старых данных через JobQueue (если доступен)
     try:
-        application.job_queue.run_once(clean_old_data, when=5)
-    except AttributeError:
-        logger.warning("JobQueue не доступен. Очистка старых данных не будет выполняться автоматически.")
-        # Выполняем очистку сразу
+        application.job_queue.run_once(lambda context: clean_old_data(), when=5)
+    except Exception as e:
+        logger.warning(f"JobQueue не доступен или ошибка: {e}. Очистка старых данных будет выполнена сразу.")
         clean_old_data()
-    
+
     logger.info("Бот запущен")
     application.run_polling()
 
