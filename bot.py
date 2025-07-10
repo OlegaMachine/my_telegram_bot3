@@ -1,6 +1,7 @@
 import os
 import logging
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from random import randint
 import asyncio
@@ -30,13 +31,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-TOKEN = "8142815825:AAEZeUHIXI2j44VDG6SrH8Vjv--jko7j7Eo"
+TOKEN = os.getenv("BOT_TOKEN", "8142815825:AAEZeUHIXI2j44VDG6SrH8Vjv--jko7j7Eo")
 DB = "timoteo_store.db"
 COURSE_DEFAULT = 1.55
+COURSE_UNSUBSCRIBED = 1.65  # Повышенный курс для неподписанных
 MIN_STARS = 50
 REF_PERCENT = 5
-ADMIN_IDS = [1012303659, 694613924]  # Ваш Telegram ID. Чтобы добавить второго админа, просто добавьте его ID через запятую, например: [1012303659, 222222222]
+ADMIN_IDS = [694613924, 1012303659]  # Ваш Telegram ID. Чтобы добавить второго админа, просто добавьте его ID через запятую, например: [1012303659, 222222222]
 PAYMENTS_DIR = "payments"
+CHANNEL_USERNAME = "https://t.me/timoteo_store"  # Канал для проверки подписки
+CHECK_SUBSCRIPTION = True  # Включить проверку подписки
 
 # Создаем папку для платежей
 os.makedirs(PAYMENTS_DIR, exist_ok=True)
@@ -177,6 +181,53 @@ def get_user(user_id):
         if conn:
             conn.close()
 
+async def check_subscription(user_id, context):
+    """Проверка подписки пользователя на канал"""
+    try:
+        # Извлекаем username из полного URL
+        if CHANNEL_USERNAME.startswith('https://t.me/'):
+            channel_username = CHANNEL_USERNAME.replace('https://t.me/', '')
+        else:
+            channel_username = CHANNEL_USERNAME.replace('@', '')
+        
+        # Добавляем @ если его нет
+        if not channel_username.startswith('@'):
+            channel_username = '@' + channel_username
+            
+        logger.info(f"Проверяем подписку для {user_id} в канале {channel_username}")
+        
+        # Сначала проверим, существует ли канал
+        try:
+            chat = await context.bot.get_chat(channel_username)
+            logger.info(f"Канал найден: {chat.title} (ID: {chat.id})")
+        except Exception as e:
+            logger.error(f"Канал {channel_username} не найден или недоступен: {e}")
+            # Если канал недоступен, считаем пользователя неподписанным
+            return False
+        
+        # Проверяем подписку пользователя
+        try:
+            chat_member = await context.bot.get_chat_member(channel_username, user_id)
+            logger.info(f"Статус участника {user_id}: {chat_member.status}")
+            
+            # Проверяем все возможные статусы подписки
+            is_subscribed = chat_member.status in ['member', 'administrator', 'creator', 'owner']
+            logger.info(f"Результат проверки подписки для {user_id}: {is_subscribed}")
+            
+            return is_subscribed
+        except Exception as e:
+            logger.error(f"Ошибка при получении статуса участника {user_id}: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Общая ошибка проверки подписки для {user_id}: {e}")
+        return False
+
+def get_user_course(user_id, context):
+    """Получение курса для пользователя с учётом подписки"""
+    # Пока что возвращаем стандартный курс, подписка будет проверяться асинхронно
+    return COURSE_DEFAULT
+
 def update_stars(user_id, amount):
     """Обновление баланса звёзд"""
     try:
@@ -282,16 +333,22 @@ def clean_old_data():
             conn.close()
 
 # ========== КЛАВИАТУРЫ ==========
-def main_menu_keyboard():
+def main_menu_keyboard(is_subscribed=True):
     keyboard = [
-        [InlineKeyboardButton("🌟 Купить звёзды", callback_data="buy")],
+        [InlineKeyboardButton("⭐️ Купить звёзды", callback_data="buy")],
         [InlineKeyboardButton("🎁 Ежедневный бонус", callback_data="daily_bonus")],
         [InlineKeyboardButton("🤝 Рефералы", callback_data="referrals")],
         [InlineKeyboardButton("🧾 Профиль", callback_data="profile")],
-        [InlineKeyboardButton("💸 Обменять бонус", callback_data="exchange_bonus")],
-        [InlineKeyboardButton("📦 Мои заказы", callback_data="my_orders")],
         [InlineKeyboardButton("📝 Оставить отзыв", callback_data="feedback")],
     ]
+    
+    # Добавляем кнопки подписки только для неподписанных
+    if not is_subscribed:
+        keyboard.extend([
+            [InlineKeyboardButton("🔗 Подписаться на канал", url=CHANNEL_USERNAME)],
+            [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subscription")],
+        ])
+    
     return InlineKeyboardMarkup(keyboard)
 
 def admin_menu_keyboard():
@@ -329,42 +386,96 @@ def admin_confirm_keyboard(order_id):
         ]
     ])
 
+def profile_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Мои заказы", callback_data="my_orders")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+    ])
+
+def referrals_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💸 Обменять бонус", callback_data="exchange_bonus")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+    ])
+
 async def show_main_menu(update, context, greeting=False):
-    current_course = float(get_setting('course') or COURSE_DEFAULT)
+    user_id = update.effective_user.id if update.effective_user else None
+    logger.info(f"show_main_menu вызван для пользователя {user_id}")
+    is_subscribed = await check_subscription(user_id, context) if user_id else True
+    logger.info(f"Пользователь {user_id} подписан: {is_subscribed}")
+    current_course = COURSE_DEFAULT if is_subscribed else COURSE_UNSUBSCRIBED
+    logger.info(f"Курс для пользователя {user_id}: {current_course}₽")
+    
     if greeting:
         text = (
             "👋 Приветствую в Timoteo Store!⭐️ Тут вы можете купить звезды телеграм по лучшей цене. Быстро, дешево, безопасно! 🔐\n"
+            f"Текущий курс: {current_course}₽ за 1 звезду\n"
             "Поддержка бота: @timoteo4"
         )
     else:
         text = (
-            f"Текущий курс: {current_course}₽ за 1 звезду\n\n"
+            f"Текущий курс: {current_course}₽ за 1 звезду\n"
             "Выбери действие:"
         )
-    if update.message:
-        await update.message.reply_text(text, reply_markup=main_menu_keyboard())
-    elif hasattr(update, 'callback_query') and update.callback_query:
-        await update.callback_query.message.edit_text(text, reply_markup=main_menu_keyboard())
+    
+    logger.info(f"Отправляем меню пользователю {user_id} с текстом: {text[:50]}...")
+    
+    menu_msg_id = context.user_data.get('main_menu_message_id')
+    # Всегда пытаемся удалить старое главное меню перед отправкой нового
+    if menu_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=menu_msg_id)
+        except Exception as e:
+            logger.info(f"Не удалось удалить старое главное меню: {e}")
+    # Отправляем новое меню только через send_message
+    sent = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=main_menu_keyboard(is_subscribed))
+    context.user_data['main_menu_message_id'] = sent.message_id
 
 # ========== Fallback-обработчик ==========
 MENU_KEYWORDS = {"меню", "назад", "главное меню", "menu", "main menu"}
 
 def contains_menu_keyword(text):
     text = (text or "").lower().replace(" ", "")
+    logger.info(f"Проверяем ключевые слова в тексте: '{text}'")
     for kw in MENU_KEYWORDS:
         if kw.replace(" ", "") in text:
+            logger.info(f"Найдено ключевое слово: '{kw}' в тексте: '{text}'")
             return True
+    logger.info(f"Ключевые слова не найдены в тексте: '{text}'")
     return False
 
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "") if update.message else ""
+    user_id = update.effective_user.id if update.effective_user else None
+    logger.info(f"fallback_handler вызван для пользователя {user_id} с текстом: '{text}'")
+    
     if contains_menu_keyword(text):
-        await show_main_menu(update, context, greeting=False)
+        logger.info(f"Найдено ключевое слово меню в тексте: '{text}'")
+        if user_id:
+            msg_ids = context.user_data.get('bot_message_ids', []) if context.user_data else []
+            logger.info(f"Удаляем {len(msg_ids)} старых сообщений")
+            for mid in msg_ids:
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=mid)
+                except Exception as e:
+                    logger.info(f"Не удалось удалить сообщение {mid}: {e}")
+            context.user_data['bot_message_ids'] = []
+            is_subscribed = await check_subscription(user_id, context)
+            current_course = COURSE_DEFAULT if is_subscribed else COURSE_UNSUBSCRIBED
+            text = (
+                "👋 Приветствую в Timoteo Store!⭐️ Тут вы можете купить звезды телеграм по лучшей цене. Быстро, дешево, безопасно! 🔐\n"
+                f"Текущий курс: {current_course}₽ за 1 звезду\n"
+                "Поддержка бота: @timoteo4"
+            )
+            sent = await context.bot.send_message(chat_id=user_id, text=text, reply_markup=main_menu_keyboard(is_subscribed))
+            context.user_data['bot_message_ids'] = [sent.message_id]
+            logger.info(f"Отправлено новое главное меню для пользователя {user_id}")
         return ConversationHandler.END
     if update.message:
+        logger.info(f"Неизвестная команда: '{text}'")
         await update.message.reply_text(
             "Я не знаю такой команды. Для возврата напишите 'меню' или используйте кнопку.",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(is_subscribed=True)
         )
     return ConversationHandler.END
 
@@ -375,10 +486,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     
     if update and hasattr(update, 'message'):
         try:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         except:
             try:
-                await update.callback_query.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+                await update.callback_query.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
             except:
                 pass
 
@@ -392,13 +503,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             register_user(user.id, user.username or "", referral_id)
         context.user_data['course'] = float(get_setting('course') or COURSE_DEFAULT)
         await show_main_menu(update, context, greeting=True)
-        if user and hasattr(user, 'id') and user.id in ADMIN_IDS and update.message:
-            await update.message.reply_text("⚙️ Доступно админ-меню: /admin")
-            
+        # Сообщение для админа отправляем отдельным сообщением, не дублируя главное меню
+        if user and hasattr(user, 'id') and user.id in ADMIN_IDS:
+            await context.bot.send_message(chat_id=user.id, text="⚙️ Доступно админ-меню: /admin")
     except Exception as e:
         logger.error(f"Ошибка в start: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
@@ -425,7 +536,8 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка в admin_command: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
+        return ConversationHandler.END
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик отмены действий"""
@@ -433,16 +545,25 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query if hasattr(update, 'callback_query') else None
         if query:
             await query.answer()
-            if hasattr(query, 'message') and query.message:
-                await query.message.edit_text("Действие отменено.", reply_markup=main_menu_keyboard())
+            if hasattr(query, 'message') and isinstance(query.message, Message):
+                try:
+                    await show_main_menu(update, context, greeting=False)
+                except Exception as e:
+                    logger.info(f"Не удалось отредактировать главное меню после отмены: {e}")
+                    await query.message.edit_text("Действие отменено.")
             return ConversationHandler.END
         if update.message:
-            await update.message.reply_text("Действие отменено.", reply_markup=main_menu_keyboard())
+            try:
+                await show_main_menu(update, context, greeting=False)
+            except Exception as e:
+                logger.info(f"Не удалось отредактировать главное меню после отмены: {e}")
+                await update.message.reply_text("Действие отменено.")
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка в cancel_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
+        return ConversationHandler.END
 
 # ========== ОБРАБОТЧИКИ СОСТОЯНИЙ ==========
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -488,12 +609,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             # Уведомляем пользователя о подтверждении
             try:
+                # Явно отправляем уведомление даже если user_id в ADMIN_IDS
                 await context.bot.send_message(
                     order['user_id'],
-                    "Спасибо за покупку! Ваш заказ подтверждён и будет выполнен в ближайшее время.\n"
-                    "Буду рад если вы оставите свой отзыв здесь - @otzivi_timoteo\n"
-                    "Мой магазин со всеми товарами - @timoteo_store\n"
-                    "Жду вас снова."
+                    "Спасибо за покупку! Ваш заказ выполнен. Буду рад если вы оставите свой отзыв здесь - @otzivi_timoteo Мой магазин со всеми товарами - @timoteo_store"
                 )
             except Exception as e:
                 logger.error(f"Не удалось уведомить пользователя о подтверждении заказа: {e}")
@@ -551,17 +670,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reward = random.randint(1, 5)
             else:
                 reward = random.randint(6, 100)
-            update_stars(user_id, reward)
+            
+            # Добавляем бонус в referral_bonus (рубли) вместо stars
             try:
                 conn = db_connect()
                 cur = conn.cursor()
-                cur.execute("UPDATE users SET last_spin=? WHERE user_id=?", (datetime.now().strftime("%Y-%m-%d"), user_id))
+                cur.execute("UPDATE users SET referral_bonus = referral_bonus + ?, last_spin=? WHERE user_id=?", (reward, datetime.now().strftime("%Y-%m-%d"), user_id))
                 conn.commit()
+                logger.info(f"Ежедневный бонус {reward}₽ начислен пользователю {user_id}")
             finally:
                 if conn:
                     conn.close()
+            
             if hasattr(query, 'message') and isinstance(query.message, Message):
-                await query.message.reply_text(f"🎁 Ваш ежедневный бонус: {reward} звёзд!\n\nЗаглядывайте каждый день и получайте больше!")
+                await query.message.reply_text(f"🎁 Ваш ежедневный бонус: {reward}₽!\n\nЗаглядывайте каждый день и получайте больше!")
             return ConversationHandler.END
         elif data == "referrals":
             user = get_user(user_id)
@@ -569,13 +691,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if hasattr(query, 'message') and isinstance(query.message, Message):
                     await query.message.reply_text(
                         f"🤝 Рефералы: {user['referrals_count']}\n"
-                        f"🎁 Бонус: {user['referral_bonus']}\n\n"
+                        f"🎁 Бонус: {user['referral_bonus']}₽\n\n"
                         f"Реферальная ссылка:\n"
-                        f"t.me/{context.bot.username}?start={user_id}"
+                        f"t.me/{context.bot.username}?start={user_id}",
+                        reply_markup=referrals_keyboard()
                     )
             else:
                 if hasattr(query, 'message') and isinstance(query.message, Message):
-                    await query.message.reply_text("Данные не найдены.")
+                    await query.message.reply_text("Данные не найдены.", reply_markup=cancel_keyboard())
             return ConversationHandler.END
         elif data == "profile":
             user = get_user(user_id)
@@ -584,12 +707,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text(
                         f"🧾 Профиль:\n"
                         f"⭐ Звёзд: {user['stars']}\n"
-                        f"🤝 Бонус: {user['referral_bonus']}\n"
-                        f"👥 Приглашено: {user['referrals_count']}"
+                        f"🤝 Бонус: {user['referral_bonus']}₽\n"
+                        f"👥 Приглашено: {user['referrals_count']}\n\n"
+                        f"Выберите действие:",
+                        reply_markup=profile_keyboard()
                     )
             else:
                 if hasattr(query, 'message') and isinstance(query.message, Message):
-                    await query.message.reply_text("Данные не найдены.")
+                    await query.message.reply_text("Данные не найдены.", reply_markup=cancel_keyboard())
             return ConversationHandler.END
         elif data == "my_orders":
             orders = get_orders(user_id)
@@ -634,6 +759,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(msg, reply_markup=cancel_keyboard(show_main_menu=False))
             context.user_data['max_bonus'] = bonus
             return EXCHANGE_BONUS
+        elif data == "check_subscription":
+            user_id = query.from_user.id
+            import asyncio
+            await query.answer("Проверяем подписку...", show_alert=False)
+            await asyncio.sleep(1.5)  # Даем Telegram время обновить статус
+            try:
+                is_subscribed = await check_subscription(user_id, context)
+                logger.info(f"Проверка подписки: user_id={user_id}, is_subscribed={is_subscribed}")
+                if is_subscribed:
+                    # Удаляем сообщение с кнопками подписки, если это возможно
+                    msg = getattr(query, 'message', None)
+                    if msg and hasattr(msg, 'delete'):
+                        try:
+                            await msg.delete()
+                        except Exception as e:
+                            logger.warning(f"Не удалось удалить сообщение с кнопками подписки: {e}")
+                    # Отправляем новое сообщение с главным меню
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ Вы подписаны на канал {CHANNEL_USERNAME}!\nТекущий курс: {COURSE_DEFAULT}₽ за 1 звезду\n\nВыбери действие:",
+                        reply_markup=main_menu_keyboard(is_subscribed=True)
+                    )
+                else:
+                    # Показываем сообщение для неподписанных с кнопками подписки
+                    await query.edit_message_text(
+                        f"❌ Вы не подписаны на канал {CHANNEL_USERNAME}.\n"
+                        f"Ваш курс: {COURSE_UNSUBSCRIBED}₽ за 1 звезду\n"
+                        f"Подпишитесь для получения лучшего курса!",
+                        reply_markup=main_menu_keyboard(is_subscribed=False)
+                    )
+            except Exception as e:
+                logger.error(f"Ошибка при проверке подписки: {e}")
+                await query.edit_message_text(
+                    f"⚠️ Ошибка проверки подписки. Попробуйте позже.\n"
+                    f"Или подпишитесь на канал {CHANNEL_USERNAME} и нажмите кнопку снова."
+                )
+            return ConversationHandler.END
         elif data == "set_course":
             if user_id not in ADMIN_IDS:
                 if hasattr(query, 'message') and isinstance(query.message, Message):
@@ -687,7 +849,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Ошибка получения статистики: {e}")
                 if hasattr(query, 'message') and isinstance(query.message, Message):
-                    await query.message.reply_text("⚠️ Ошибка получения статистики")
+                    await query.message.reply_text("⚠️ Ошибка получения статистики", reply_markup=main_menu_keyboard(is_subscribed=True))
             finally:
                 if conn:
                     conn.close()
@@ -701,12 +863,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("Введите текст рассылки:")
             return ADMIN_BROADCAST
         elif data == "main_menu":
-            if hasattr(query, 'message') and isinstance(query.message, Message):
-                await query.message.edit_text("Выбери действие:", reply_markup=main_menu_keyboard())
+            try:
+                if hasattr(query, 'message') and isinstance(query.message, Message):
+                    await query.message.delete()
+            except Exception as e:
+                logger.error(f"Ошибка при возврате в главное меню: {e}")
             return ConversationHandler.END
         elif data == "cancel":
-            if hasattr(query, 'message') and isinstance(query.message, Message):
-                await query.message.edit_text("Действие отменено.", reply_markup=main_menu_keyboard())
+            try:
+                if hasattr(query, 'message') and isinstance(query.message, Message):
+                    await query.message.delete()
+            except Exception as e:
+                logger.error(f"Ошибка при отмене действия: {e}")
             return ConversationHandler.END
         elif data == "pay_order":
             price = context.user_data.get("price") if context.user_data else None
@@ -717,8 +885,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"<b>РЕКВИЗИТЫ ДЛЯ ОПЛАТЫ:</b>\n"
                     f"+79652234445 Т-банк\n\n"
                     f"Сумма к оплате: <b>{price}₽</b>\n\n"
-                    f"После оплаты напишите <b>оплатил</b> для подтверждения.\n"
-                    f"\nВаша оплата будет проверена оператором. Звёзды будут начислены после подтверждения.",
+                    f"После оплаты напишите <b>оплатил</b> для подтверждения.",
                     reply_markup=cancel_keyboard(),
                     parse_mode=ParseMode.HTML
                 )
@@ -748,7 +915,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка в button_handler: {e}")
         if hasattr(update, 'callback_query') and update.callback_query and hasattr(update.callback_query, 'message') and update.callback_query.message:
-            await update.callback_query.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+            await update.callback_query.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def buy_username_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -767,13 +934,27 @@ async def buy_username_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 await update.message.reply_text("Ошибка! Username должен начинаться с '@'. Попробуйте ещё раз.", reply_markup=cancel_keyboard(show_main_menu=False))
             return BUY_USERNAME
         context.user_data["recipient_username"] = username
+        
+        # Получаем актуальный курс для пользователя
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id:
+            is_subscribed = await check_subscription(user_id, context)
+            current_course = COURSE_DEFAULT if is_subscribed else COURSE_UNSUBSCRIBED
+        else:
+            current_course = COURSE_UNSUBSCRIBED
+        
         if isinstance(update.message, Message):
-            await update.message.reply_text(f"Введите количество звёзд (мин. {MIN_STARS}):", reply_markup=cancel_keyboard(show_main_menu=False))
+            await update.message.reply_text(
+                f"✅ Получатель: {username}\n"
+                f"💰 Актуальный курс: {current_course}₽ за 1 звезду\n\n"
+                f"Введите количество звёзд (мин. {MIN_STARS}):",
+                reply_markup=cancel_keyboard(show_main_menu=False)
+            )
         return BUY_AMOUNT
     except Exception as e:
         logger.error(f"Ошибка в buy_username_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def buy_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -794,22 +975,30 @@ async def buy_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Ошибка в buy_amount_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
     if amount < MIN_STARS:
         if isinstance(update.message, Message):
             await update.message.reply_text(f"Минимум {MIN_STARS} звёзд. Попробуйте снова.", reply_markup=cancel_keyboard(show_main_menu=False))
         return BUY_AMOUNT
     context.user_data["stars_amount"] = amount
-    price = round(amount * context.user_data.get('course', COURSE_DEFAULT), 2)
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id:
+        is_subscribed = await check_subscription(user_id, context)
+        current_course = COURSE_DEFAULT if is_subscribed else COURSE_UNSUBSCRIBED
+    else:
+        current_course = COURSE_UNSUBSCRIBED  # По умолчанию повышенный курс
+    price = round(amount * current_course, 2)
     context.user_data["price"] = price
+    context.user_data["course"] = current_course
     recipient = context.user_data.get("recipient_username", "-")
     confirm_text = (
-        f"<b>Подтверждение заказа ✅</b>\n"
-        f"Получатель: <b>{recipient}</b>\n"
-        f"Количество звёзд: <b>{amount} ⭐️</b>\n"
-        f"Сумма к оплате: <b>{price}₽</b>\n\n"
-        f"Для оплаты заказа, нажмите <b>Оплатить</b>."
+        f"✅ Подтверждение заказа \n"
+        f"👤 Получатель: {recipient}\n"
+        f"⭐️ Количество звёзд: {amount} ⭐️\n"
+        f"💰 Курс: {current_course}₽ за 1 звезду\n"
+        f"💳 Сумма к оплате: {price}₽\n\n"
+        f"Для оплаты заказа, нажмите Оплатить."
     )
     if isinstance(update.message, Message):
         await update.message.reply_text(confirm_text, reply_markup=confirm_order_keyboard(), parse_mode=ParseMode.HTML)
@@ -863,7 +1052,7 @@ async def wait_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             if update.message:
                 await update.message.reply_text(
                     "Спасибо! Ваша оплата будет проверена оператором. Ожидайте подтверждения.",
-                    reply_markup=main_menu_keyboard()
+                    reply_markup=main_menu_keyboard(is_subscribed=True)
                 )
             return ConversationHandler.END
         else:
@@ -873,7 +1062,7 @@ async def wait_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Ошибка в wait_payment_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def admin_set_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -885,7 +1074,7 @@ async def admin_set_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         if user_id not in ADMIN_IDS:
             if update.message:
-                await update.message.reply_text("❌ Доступ запрещён.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("❌ Доступ запрещён.", reply_markup=main_menu_keyboard(is_subscribed=True))
             return ConversationHandler.END
         try:
             new_course = float(update.message.text.strip())
@@ -896,12 +1085,12 @@ async def admin_set_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_setting("course", str(new_course))
         context.user_data['course'] = new_course
         if update.message:
-            await update.message.reply_text(f"Курс обновлён: {new_course}₽", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"Курс обновлён: {new_course}₽", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка в admin_set_course: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -913,7 +1102,7 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
         user_id = update.effective_user.id
         if user_id not in ADMIN_IDS:
             if update.message:
-                await update.message.reply_text("❌ Доступ запрещён.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text("❌ Доступ запрещён.", reply_markup=main_menu_keyboard(is_subscribed=True))
             return ConversationHandler.END
         text = update.message.text.strip() if update.message and update.message.text else ""
         if not text:
@@ -934,7 +1123,7 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
                 except Exception as e:
                     logger.warning(f"Ошибка отправки {uid}: {e}")
             if update.message:
-                await update.message.reply_text(f"Рассылка отправлена {count} пользователям.", reply_markup=main_menu_keyboard())
+                await update.message.reply_text(f"Рассылка отправлена {count} пользователям.", reply_markup=main_menu_keyboard(is_subscribed=True))
         finally:
             if conn:
                 conn.close()
@@ -942,7 +1131,7 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Ошибка в admin_broadcast_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def leave_feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -969,13 +1158,13 @@ async def leave_feedback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if update.message:
             await update.message.reply_text(
                 "✅ Спасибо за ваш отзыв!",
-                reply_markup=main_menu_keyboard()
+                reply_markup=main_menu_keyboard(is_subscribed=True)
             )
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка в leave_feedback_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 async def exchange_bonus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1017,12 +1206,12 @@ async def exchange_bonus_handler(update: Update, context: ContextTypes.DEFAULT_T
             if conn:
                 conn.close()
         if update.message:
-            await update.message.reply_text(f"✅ {amount}₽ успешно обменяны на {stars} звёзд!", reply_markup=main_menu_keyboard())
+            await update.message.reply_text(f"✅ {amount}₽ успешно обменяны на {stars} звёзд!", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка в exchange_bonus_handler: {e}")
         if update.message:
-            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.", reply_markup=main_menu_keyboard(is_subscribed=True))
         return ConversationHandler.END
 
 # ========== ЗАПУСК БОТА ==========
@@ -1072,6 +1261,9 @@ def main():
         allow_reentry=True,
     )
 
+    # Глобальный обработчик для текста с высоким приоритетом
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_handler), group=-1)
+    
     application.add_handler(conv_handler)
 
     # Запуск очистки старых данных через JobQueue (если доступен)
@@ -1082,7 +1274,19 @@ def main():
         clean_old_data()
 
     logger.info("Бот запущен")
-    application.run_polling()
+    
+    # Для хостинга используем webhook, для локальной разработки - polling
+    port = int(os.environ.get('PORT', 8080))
+    if os.environ.get('RAILWAY_ENVIRONMENT'):
+        # На Railway используем webhook
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            webhook_url=f"https://{os.environ.get('RAILWAY_PUBLIC_DOMAIN')}.railway.app"
+        )
+    else:
+        # Локально используем polling
+        application.run_polling()
 
 if __name__ == "__main__":
     main()
